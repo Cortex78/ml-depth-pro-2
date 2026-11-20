@@ -41,6 +41,10 @@ The last line should print a version ending in `+cu130` and `True`, and `predict
 
 Install with uv: `pip install .` ignores the CUDA index in `pyproject.toml` and installs the CPU build of PyTorch. When a video does not fit in GPU memory, the Windows driver moves the overflow to system memory, and the run slows down a lot instead of stopping with an out-of-memory error. If a video runs much slower than its first frames suggest, lower `--window` and `--overlap` as described in [Choosing settings](#choosing-settings), or set the driver to stop instead: in the NVIDIA Control Panel, under Manage 3D settings, set CUDA - Sysmem Fallback Policy to Prefer No Sysmem Fallback.
 
+### Google Colab
+
+[`notebooks/depth_pro_2_colab_a100.ipynb`](notebooks/depth_pro_2_colab_a100.ipynb) installs the repository on a Colab GPU runtime, runs the examples, times the four model sizes and compares the precisions, then runs on your own photos and videos. [Open it in Colab](https://colab.research.google.com/github/Cortex78/ml-depth-pro-2/blob/claude/festive-cerf-65vitz/notebooks/depth_pro_2_colab_a100.ipynb), choose Runtime → Change runtime type → A100 GPU, and run all cells.
+
 ## Outputs
 
 The command writes its results to the folder given by `-o`:
