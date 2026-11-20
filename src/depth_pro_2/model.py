@@ -145,8 +145,10 @@ def create_model_and_transforms(
         config: A model configuration, or the name of a preset in ``PRESETS``.
         device: The device to load the model onto; by default CUDA, then MPS, then the CPU.
         precision: Autocast dtype of the backbones and the decoder; the heads run in float32.
-            Defaults to bfloat16 on CUDA and MPS, as trained and evaluated, and to float32 on the
-            CPU, where bfloat16 autocast is much slower. ``torch.float16`` is closer to float32.
+            Defaults to bfloat16 on MPS and on NVIDIA GPUs from Ampere (compute capability 8.0)
+            on, as trained and evaluated; to float16 on older NVIDIA GPUs, which only emulate
+            bfloat16; and to float32 on the CPU, where bfloat16 autocast is much slower.
+            ``torch.float16`` is closer to float32.
 
     Returns:
         The model in eval mode, and a transform from an RGB uint8 ``(H, W, 3)`` array to a
@@ -158,7 +160,7 @@ def create_model_and_transforms(
         config = PRESETS[config]
     device = default_device() if device is None else torch.device(device)
     if precision is None:
-        precision = torch.float32 if device.type == "cpu" else torch.bfloat16
+        precision = default_precision(device)
 
     # Initializing H+'s 0.9 B parameters takes seconds on a CPU and a fraction of one on a GPU.
     with torch.device(device):
@@ -187,6 +189,25 @@ def create_model_and_transforms(
     model = model.to(device).eval()
 
     return model, partial(to_normalized_tensor, device=device)
+
+
+def default_precision(device: torch.device) -> torch.dtype:
+    """The autocast dtype for ``device`` when none is given.
+
+    bfloat16, as trained and evaluated, on MPS and on NVIDIA GPUs from Ampere (compute
+    capability 8.0) on. Older NVIDIA GPUs, such as the GeForce RTX 20 and GTX 16 series, only
+    emulate bfloat16 and have no fused attention kernel for it, so they get float16, or float32
+    before Volta (7.0). The CPU gets float32, where bfloat16 autocast is much slower.
+    """
+    if device.type == "cpu":
+        return torch.float32
+    if device.type == "cuda" and torch.version.hip is None:
+        major = torch.cuda.get_device_capability(device)[0]
+        if major < 7:
+            return torch.float32
+        if major < 8:
+            return torch.float16
+    return torch.bfloat16
 
 
 @lru_cache(maxsize=None)
@@ -237,11 +258,13 @@ class DepthPro2(nn.Module, PyTorchModelHubMixin):
     def from_pretrained(cls, pretrained_model_name_or_path, *, subfolder=None, **kwargs):
         """Load a model ``save_pretrained`` wrote, ``subfolder`` naming its folder if it has one."""
         if subfolder is not None:
-            path = Path(pretrained_model_name_or_path)
+            # Keep a Hub repo id as given: Path would turn "apple/DepthPro2" into
+            # "apple\DepthPro2" on Windows, which the Hub rejects.
+            name = str(pretrained_model_name_or_path)
+            path = Path(name)
             if not path.is_dir():
                 options = {key: kwargs[key] for key in ("revision", "token") if key in kwargs}
-                files = snapshot_download(str(path), allow_patterns=f"{subfolder}/*", **options)
-                path = Path(files)
+                path = Path(snapshot_download(name, allow_patterns=f"{subfolder}/*", **options))
             pretrained_model_name_or_path = path / subfolder
         return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
 

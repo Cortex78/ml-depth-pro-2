@@ -14,7 +14,7 @@ This repository contains the code to run the models and links to their weights. 
 
 ## Getting started
 
-On Linux or an Apple silicon Mac, install [uv](https://docs.astral.sh/uv/), clone this repository, and run:
+On Linux, Windows or an Apple silicon Mac, install [uv](https://docs.astral.sh/uv/), clone this repository, and run (on Windows, in PowerShell; see [Windows](#windows) for the GPU):
 
 ```bash
 uv run depth-pro-2 predict -i assets/example.jpg -o out/   # a photo
@@ -24,6 +24,22 @@ uv run depth-pro-2 predict -i assets/example.mp4 -o out/   # a video
 The first run downloads the weights of the default model, H+ (3.5 GB). On a laptop, add `-m depthpro2-s` to use S (97 MB) instead. The command runs on the first available device: an NVIDIA GPU (CUDA), an Apple silicon GPU (MPS), or the CPU.
 
 To process many images in one run, pass a folder or repeat `-i`. The model loads once for the whole run. Each image is predicted independently, with its own focal length. For the frames of a video, pass a video file instead, or pass the frames to `infer_video` in Python. Both process the frames jointly, with one focal length for the whole video.
+
+### Windows
+
+On Windows, `uv sync` (or the first `uv run`) installs PyTorch with CUDA 13.0 from the [PyTorch index](https://download.pytorch.org/whl/cu130), because PyPI only has CPU builds of PyTorch for Windows. CUDA 13.0 needs an NVIDIA GPU from the GeForce RTX 20 series (Turing) or newer and NVIDIA driver 580 or later. Install uv and set up the repository in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+git clone https://github.com/Cortex78/ml-depth-pro-2.git
+cd ml-depth-pro-2
+uv sync
+uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+The last line should print a version ending in `+cu130` and `True`, and `predict` should report `Loading ... onto cuda`. If it prints `False`, update the NVIDIA driver. For an older GPU, such as the GeForce GTX 10 series, replace every `cu130` in `pyproject.toml` with `cu126` and run `uv sync` again.
+
+Install with uv: `pip install .` ignores the CUDA index in `pyproject.toml` and installs the CPU build of PyTorch. When a video does not fit in GPU memory, the Windows driver moves the overflow to system memory, and the run slows down a lot instead of stopping with an out-of-memory error. If a video runs much slower than its first frames suggest, lower `--window` and `--overlap` as described in [Choosing settings](#choosing-settings), or set the driver to stop instead: in the NVIDIA Control Panel, under Manage 3D settings, set CUDA - Sysmem Fallback Policy to Prefer No Sysmem Fallback.
 
 ## Outputs
 
@@ -88,11 +104,12 @@ The defaults follow the recommendations of the paper, which gives the evidence f
   resize the frames, scale `f_px` by the same factor. With a calibrated camera, undistort the
   frames and pass the horizontal focal length, fx. When `f_px` is given, the model skips the
   field-of-view estimator.
-- **Precision.** On NVIDIA and Apple GPUs, the model runs under bfloat16 autocast by default
-  (`--precision bf16`), as in the paper; on the CPU, it runs in float32. `--precision fp16` uses
-  float16 autocast instead, and `--precision fp32` runs in float32 without autocast. On a GPU
-  without bfloat16 support, use `fp16`. In Python, pass `precision=torch.float16` or
-  `precision=torch.float32` to `create_model_and_transforms`.
+- **Precision.** On Apple GPUs and on NVIDIA GPUs from Ampere (GeForce RTX 30) on, the model
+  runs under bfloat16 autocast by default (`--precision bf16`), as in the paper; on the CPU, it
+  runs in float32. Older NVIDIA GPUs, such as the GeForce RTX 20 and GTX 16 series, only emulate
+  bfloat16, so they default to float16, and GPUs before Volta to float32. `--precision fp16` uses
+  float16 autocast instead, and `--precision fp32` runs in float32 without autocast. In Python,
+  pass `precision=torch.float16` or `precision=torch.float32` to `create_model_and_transforms`.
 
 ## Python
 

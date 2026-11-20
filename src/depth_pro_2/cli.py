@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from collections import Counter
 from fractions import Fraction
 from pathlib import Path
@@ -102,8 +103,9 @@ def main_cli():
     type=click.Choice(sorted(PRECISIONS)),
     default=None,
     help="Autocast dtype of the backbones and the decoder, the heads staying float32. By default "
-    "bf16, as trained and evaluated, on a GPU and fp32 on the CPU, where bf16 is much slower. "
-    "fp16 is closer to fp32 than bf16 is; fp32 runs without autocast.",
+    "bf16, as trained and evaluated, on Apple GPUs and NVIDIA GPUs from Ampere (RTX 30) on; fp16 "
+    "on older NVIDIA GPUs, which only emulate bf16; and fp32 on the CPU, where bf16 is much "
+    "slower. fp16 is closer to fp32 than bf16 is; fp32 runs without autocast.",
 )
 @click.option(
     "--save-npz",
@@ -140,6 +142,9 @@ def predict_cli(
       NAME-depth16/NAME-depth16.000000.png  the same for a video, one file per frame
     Colors follow the Turbo map: dark blue is infinitely far, where depth is inf.
     """  # noqa: D301 - click keeps a paragraph after \b as written.
+    # A redirected stdout on Windows uses the ANSI code page, which cannot encode every file name.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")
     logging.basicConfig(format="%(message)s")
     logging.getLogger("depth_pro_2").setLevel(logging.INFO)
 
@@ -155,12 +160,18 @@ def predict_cli(
     click.echo(f"Loading {model} onto {device} in {str(net.precision).removeprefix('torch.')}.")
     output_path.mkdir(parents=True, exist_ok=True)
     for path in inputs:
-        if path.suffix.lower() in VIDEO_EXTENSIONS:
-            predict_video(
-                net, transform, path, output_path, mode, window, overlap, save_npz, save_png16
-            )
-        else:
-            predict_image(net, transform, path, output_path, save_npz, save_png16)
+        try:
+            if path.suffix.lower() in VIDEO_EXTENSIONS:
+                predict_video(
+                    net, transform, path, output_path, mode, window, overlap, save_npz, save_png16
+                )
+            else:
+                predict_image(net, transform, path, output_path, save_npz, save_png16)
+        except torch.OutOfMemoryError as error:
+            raise click.ClickException(
+                f"Out of {device.type.upper()} memory on {path}. For a video, lower --window and "
+                f"--overlap first; then use a smaller model, such as -m depthpro2-s."
+            ) from error
 
 
 def collect_inputs(paths: Sequence[Path], output_path: Path) -> list[Path]:

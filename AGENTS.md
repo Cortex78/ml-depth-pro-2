@@ -1,8 +1,8 @@
 # AGENTS.md
 
-Depth Pro 2: metric depth for photos and videos, on Linux and Apple silicon Macs. The README has
-the usage, what the outputs mean and which settings to use; read it first. This file adds what you
-need to call, extend or export the code.
+Depth Pro 2: metric depth for photos and videos, on Linux, Windows and Apple silicon Macs. The
+README has the usage, what the outputs mean and which settings to use; read it first. This file adds
+what you need to call, extend or export the code.
 
 ## Setup and check
 
@@ -27,6 +27,9 @@ uv run depth-pro-2 predict -i assets/example.mp4 -o out/ -m depthpro2-s
 
 ## Facts not in the README
 
+- Windows: `pyproject.toml` takes torch and torchvision from the PyTorch CUDA index on Windows
+  only (`[tool.uv.sources]`), since PyPI's Windows torch is CPU-only. Keep the two on the same
+  index: timm imports torchvision, whose binary must match torch.
 - Weights: `checkpoints/<file>` under the current working directory is used instead of
   downloading, with the file names of `PRESETS` and `DepthPro2Config.fov_checkpoint_uri`
   (e.g. `depthpro2-s-bgcc6f8bg3.pt` and `depthpro2-fov-ew55zg4kq7.pt`).
