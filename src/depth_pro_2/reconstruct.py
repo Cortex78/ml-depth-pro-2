@@ -13,7 +13,7 @@ length for the video. That makes each frame an RGB-D image, and the video an RGB
    where features are too few. A pose graph reconciles the pairs. The depth is metric, so the
    trajectory is in meters.
 2. Fusion: each keyframe's depth goes into a truncated signed distance volume (TSDF) at its
-   pose, from which come a colored mesh and a point cloud with normals.
+   pose, from which come a colored mesh and its vertices as a point cloud.
 
 It needs Open3D and OpenCV: ``uv sync --extra reconstruct``. On Linux without a display, Open3D
 also needs the EGL and OpenGL libraries (``apt-get install libegl1 libgl1 libgomp1`` on Debian or
@@ -362,7 +362,7 @@ def fuse(
     voxel: float,
     min_views: int = 2,
 ):
-    """A colored mesh, and its vertices as a point cloud with normals, fused in a TSDF.
+    """A colored mesh, and its vertices as a point cloud, fused in a TSDF.
 
     The volume is a sparse grid of voxel blocks, on the GPU if Open3D was built with CUDA. Only
     surfaces seen by at least ``min_views`` keyframes are kept (or by all, if fewer), which
@@ -405,12 +405,10 @@ def fuse(
     # Each keyframe adds a weight of 1 to the voxels it sees; the threshold is exclusive.
     views = max(1, min(min_views, integrated))
     mesh = grid.extract_triangle_mesh(weight_threshold=views - 0.5).to_legacy()
-    mesh.compute_vertex_normals()
     # Averaged colors can overshoot 1 by a rounding error.
     mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(np.asarray(mesh.vertex_colors), 0, 1))
     cloud = o3d.geometry.PointCloud(mesh.vertices)
     cloud.colors = mesh.vertex_colors
-    cloud.normals = mesh.vertex_normals
     return mesh, cloud
 
 
