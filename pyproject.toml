@@ -20,6 +20,8 @@ dependencies = [
 
 [project.optional-dependencies]
 coreml = ["coremltools==9.0"]
+# 3D reconstruction from a video: depth-pro-2 reconstruct.
+reconstruct = ["open3d>=0.19", "opencv-python-headless>=4.5"]
 
 [project.scripts]
 depth-pro-2 = "depth_pro_2.cli:main_cli"

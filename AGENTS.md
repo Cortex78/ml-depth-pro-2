@@ -22,7 +22,11 @@ uv run depth-pro-2 predict -i assets/example.mp4 -o out/ -m depthpro2-s
   decoder, and the field-of-view estimator.
 - `src/depth_pro_2/utils.py`: `load_rgb` (a photo, upright, with its EXIF focal length),
   `upright` (a decoded video frame, upright), `default_device`.
-- `src/depth_pro_2/cli.py`: the `predict` command.
+- `src/depth_pro_2/geometry.py`: what follows from depth and the focal length: intrinsics, 3D
+  points, normals, depth edges, PLY files.
+- `src/depth_pro_2/reconstruct.py`: poses (SIFT + PnP, dense odometry fallback, pose graph) and
+  TSDF fusion of a video, with Open3D and OpenCV (`uv sync --extra reconstruct`).
+- `src/depth_pro_2/cli.py`: the `predict` and `reconstruct` commands.
 - `demo/`: the Mac demo (`apple/`, Swift) and its Core ML exporter (`export/`, `uv sync --extra coreml`).
 
 ## Facts not in the README
@@ -30,6 +34,9 @@ uv run depth-pro-2 predict -i assets/example.mp4 -o out/ -m depthpro2-s
 - Windows: `pyproject.toml` takes torch and torchvision from the PyTorch CUDA index on Windows
   only (`[tool.uv.sources]`), since PyPI's Windows torch is CPU-only. Keep the two on the same
   index: timm imports torchvision, whose binary must match torch.
+- Open3D 0.20: `ScalableTSDFVolume` extracts nothing, and `VoxelBlockGrid.extract_point_cloud`
+  returns no points; `reconstruct.fuse` uses `VoxelBlockGrid.extract_triangle_mesh`, whose
+  `weight_threshold` is exclusive, and takes the cloud from the mesh's vertices.
 - Weights: `checkpoints/<file>` under the current working directory is used instead of
   downloading, with the file names of `PRESETS` and `DepthPro2Config.fov_checkpoint_uri`
   (e.g. `depthpro2-s-bgcc6f8bg3.pt` and `depthpro2-fov-ew55zg4kq7.pt`).

@@ -54,10 +54,18 @@ The command writes its results to the folder given by `-o`:
 | Always | `<name>-depth.png` | `<name>-depth.mp4` |
 | `--save-png16` | `<name>-depth16.png` | `<name>-depth16/`, a PNG per frame |
 | `--save-npz` | `<name>-depth.npz` | `<name>-depth/`, a file per frame |
+| `--save-normals` | `<name>-normals.png` | `<name>-normals.mp4` |
+| `--save-ply` | `<name>-points.ply` | `<name>-points/`, a file per frame |
+| `--save-all` | all of the above | all of the above |
+
+The network predicts two things: depth, at every pixel, and the field of view, which gives the focal length. Everything else here is computed from them: the normals and the 3D points follow from the depth and the focal length. For a 3D model of a whole scene from a video, see [3D reconstruction](#3d-reconstruction).
 
 - The PNG or MP4 shows depth as a color image, red near and blue far.
 - `--save-png16` adds inverse depth as 16-bit grayscale PNGs, white near and black far, for editing and compositing tools. Read them as raw data (Raw in Nuke, Non-Color in Blender). The values are scaled to the depth range of the photo, or of a video's first frame, so points that come nearer later in a video saturate at white. The command prints how to convert the values to meters.
-- `--save-npz` adds the depth itself. Each file holds `depth`, in meters, and `focallength_px`, the focal length used, in pixels.
+- `--save-npz` adds the depth itself. Each file holds `depth`, in meters, `focallength_px`, the focal length used, in pixels, and `intrinsics`, the 3x3 camera matrix. With `--save-normals`, it also holds `normals`, `(H, W, 3)` unit vectors.
+- `--save-normals` adds surface normals as a normal map: red points right, green up and blue toward the camera, as in OpenGL and Blender, so a wall facing the camera is light blue and the ground is green. Pixels without a normal, such as sky, are black. Each normal spans a few pixels (6 at 1920 wide), since depth varies too finely from pixel to pixel to give a steady normal on distant surfaces, and stays on its own side of an occlusion boundary.
+- `--save-ply` adds a colored point cloud with normals, in meters, for MeshLab, CloudCompare or Blender. It leaves out sky (`--max-depth`, 1000 m by default) and points on occlusion boundaries, which would float between the two surfaces. At 1920x1440, a file is about 25 to 40 MB.
+- The arrays and point clouds are in the camera frame of OpenCV and COLMAP: x right, y down and z forward. `intrinsics` follows OpenCV: the top-left pixel's center is at (0, 0), so the principal point is at ((width - 1) / 2, (height - 1) / 2).
 
 ### Interpreting the depth
 
@@ -66,6 +74,33 @@ The command writes its results to the folder given by `-o`:
 - Sky pixels have infinite depth or, especially with the smaller models, a finite depth of several kilometers. Clip the depth range before making a point cloud or a color image.
 - Depth scales with the focal length: a focal length 10% too long places everything 10% too far.
 - In Python, `inverse_depth` is normalized by the focal length: it equals `focallength_px / (width * depth)`, where `width` is the image width in pixels.
+
+## 3D reconstruction
+
+Depth Pro 2's depth is metric and consistent from frame to frame, so a video of a static scene is a sequence of RGB-D images, and `reconstruct` turns it into a 3D model:
+
+```bash
+uv sync --extra reconstruct
+uv run depth-pro-2 reconstruct -i assets/example.mp4 -o out/ -m depthpro2-s --colmap
+```
+
+1. It predicts depth for every frame, as `predict` does in buffered mode, with one focal length for the video.
+2. It finds the camera's motion between each keyframe and the few before it: SIFT matches, lifted to 3D by the metric depth, give each pair's motion by PnP with RANSAC; where features are too few, dense RGB-D odometry stands in. A pose graph reconciles the pairs. As the depth is metric, the camera path is in meters.
+3. It fuses the keyframes' depth in a truncated signed distance volume (TSDF), on the GPU if Open3D has CUDA, keeping surfaces seen by at least two keyframes.
+
+| Output | |
+|---|---|
+| `<name>-mesh.ply` | Colored triangle mesh, in meters |
+| `<name>-cloud.ply` | Its vertices as a point cloud with normals |
+| `<name>-cameras.json` | The intrinsics, and each keyframe's camera-to-world pose |
+| `<name>-trajectory.txt` | The same poses in the TUM format |
+| `<name>-colmap/` | With `--colmap`: a COLMAP text model (`sparse/0`) and the keyframes (`images/`) |
+
+The world frame is the first keyframe's camera frame: x right, y down and z forward. The COLMAP model can be refined with COLMAP, or used directly to train Gaussian splatting; its 3D points come from the fused cloud, without 2D observations.
+
+Settings: `--stride N` uses every N-th frame as a keyframe, which long videos need (depth is still predicted for every frame). `--resolution` is the size of the frames used for poses and fusion (960 px on the longer side by default). `--max-depth` leaves out farther depth, by default 3 times the median depth, and `--voxel` sets the size of the fused volume's voxels, by default the median depth divided by 300.
+
+It works best on static scenes filmed with steady motion and some texture. Moving objects are mostly left out of the mesh but can mislead the poses when they fill the frame; mirrors, glass and featureless walls are hard; and a long video that never revisits a place drifts slowly, as there is no loop closure beyond the last few keyframes. On Linux without a display, Open3D also needs the EGL and OpenGL libraries: `sudo apt-get install libegl1 libgl1 libgomp1`.
 
 ## Models
 

@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import logging
 import sys
-from collections import Counter
+from collections import Counter, deque
+from contextlib import ExitStack
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -19,6 +21,8 @@ import torch
 from matplotlib import colormaps
 from PIL import Image
 
+from .geometry import intrinsics, normals_to_rgb, point_cloud, write_ply
+from .geometry import normals as depth_normals
 from .model import (
     DEFAULT_MODEL,
     DEFAULT_OVERLAP,
@@ -119,6 +123,30 @@ def main_cli():
     help="Also write inverse depth as 16-bit grayscale PNG, for editing and compositing tools: "
     "white is near and black is infinitely far, on the color preview's scale.",
 )
+@click.option(
+    "--save-normals",
+    is_flag=True,
+    help="Also write surface normals, computed from the depth, as a normal map: a PNG for an "
+    "image, an MP4 for a video. With --save-npz, the .npz also holds them, in the camera frame.",
+)
+@click.option(
+    "--save-ply",
+    is_flag=True,
+    help="Also write a colored 3D point cloud with normals as .ply, in meters in the camera frame. "
+    "A video gets one file per frame, about 25 MB each at 1920x1440.",
+)
+@click.option(
+    "--max-depth",
+    type=click.FloatRange(min=0, min_open=True),
+    default=1000.0,
+    show_default=True,
+    help="--save-ply only: leave out points farther than this many meters, such as sky.",
+)
+@click.option(
+    "--save-all",
+    is_flag=True,
+    help="Write every output: --save-npz, --save-png16, --save-normals and --save-ply.",
+)
 def predict_cli(
     input_path: tuple[Path, ...],
     output_path: Path,
@@ -129,6 +157,10 @@ def predict_cli(
     precision: str | None,
     save_npz: bool,
     save_png16: bool,
+    save_normals: bool,
+    save_ply: bool,
+    max_depth: float,
+    save_all: bool,
 ):
     """Predict metric depth for images and videos.
 
@@ -136,11 +168,19 @@ def predict_cli(
     Writes into the output folder, for each input NAME.ext:
       NAME-depth.png                        inverse depth in color, for an image
       NAME-depth.mp4                        the same for a video
-      NAME-depth.npz                        with --save-npz: depth in meters and focallength_px
+      NAME-depth.npz                        with --save-npz: depth in meters, focallength_px
+                                            and the 3x3 intrinsics, and normals with
+                                            --save-normals
       NAME-depth/000000.npz                 the same for a video, one file per frame
       NAME-depth16.png                      with --save-png16: inverse depth in 16-bit gray
       NAME-depth16/NAME-depth16.000000.png  the same for a video, one file per frame
-    Colors follow the Turbo map: dark blue is infinitely far, where depth is inf.
+      NAME-normals.png                      with --save-normals: normal map, for an image
+      NAME-normals.mp4                      the same for a video
+      NAME-points.ply                       with --save-ply: colored point cloud with normals
+      NAME-points/000000.ply                the same for a video, one file per frame
+    Colors follow the Turbo map: dark blue is infinitely far, where depth is inf. Normal maps
+    follow the OpenGL convention: red right, green up and blue toward the camera. Arrays and
+    point clouds are in the camera frame of OpenCV: x right, y down and z forward.
     """  # noqa: D301 - click keeps a paragraph after \b as written.
     # A redirected stdout on Windows uses the ANSI code page, which cannot encode every file name.
     if hasattr(sys.stdout, "reconfigure"):
@@ -152,6 +192,13 @@ def predict_cli(
         raise click.BadParameter(
             f"{overlap} must be less than --window ({window}).", param_hint="'--overlap'"
         )
+    outputs = Outputs(
+        npz=save_npz or save_all,
+        png16=save_png16 or save_all,
+        normals=save_normals or save_all,
+        ply=save_ply or save_all,
+        max_depth=max_depth,
+    )
     inputs = collect_inputs(input_path, output_path)
     device = default_device()
     net, transform = create_model_and_transforms(
@@ -162,16 +209,213 @@ def predict_cli(
     for path in inputs:
         try:
             if path.suffix.lower() in VIDEO_EXTENSIONS:
-                predict_video(
-                    net, transform, path, output_path, mode, window, overlap, save_npz, save_png16
-                )
+                predict_video(net, transform, path, output_path, mode, window, overlap, outputs)
             else:
-                predict_image(net, transform, path, output_path, save_npz, save_png16)
+                predict_image(net, transform, path, output_path, outputs)
         except torch.OutOfMemoryError as error:
             raise click.ClickException(
                 f"Out of {device.type.upper()} memory on {path}. For a video, lower --window and "
                 f"--overlap first; then use a smaller model, such as -m depthpro2-s."
             ) from error
+
+
+@main_cli.command("reconstruct")
+@click.option(
+    "-i",
+    "--input-path",
+    type=click.Path(path_type=Path, exists=True),
+    required=True,
+    help="A video, or a folder of photos of the same size, in order, of a static scene.",
+)
+@click.option(
+    "-o",
+    "--output-path",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Folder to write the reconstruction to.",
+)
+@click.option(
+    "-m",
+    "--model",
+    type=click.Choice(sorted(PRESETS)),
+    default=DEFAULT_MODEL,
+    show_default=True,
+    help="Which Depth Pro 2 variant to run.",
+)
+@click.option("--window", type=click.IntRange(min=1), default=DEFAULT_WINDOW, show_default=True)
+@click.option("--overlap", type=click.IntRange(min=0), default=DEFAULT_OVERLAP, show_default=True)
+@click.option("--precision", type=click.Choice(sorted(PRECISIONS)), default=None)
+@click.option(
+    "--stride",
+    type=click.IntRange(min=1),
+    default=1,
+    show_default=True,
+    help="Use every N-th frame as a keyframe. Raise it for long videos; depth is still "
+    "predicted for every frame, so it stays consistent.",
+)
+@click.option(
+    "--resolution",
+    type=click.IntRange(min=64),
+    default=960,
+    show_default=True,
+    help="Longer side, in pixels, of the frames used for poses and fusion.",
+)
+@click.option(
+    "--max-depth",
+    type=click.FloatRange(min=0, min_open=True),
+    default=None,
+    help="Leave out depth beyond this many meters, such as sky. Default: 3 times the median depth.",
+)
+@click.option(
+    "--voxel",
+    type=click.FloatRange(min=0, min_open=True),
+    default=None,
+    help="Voxel size of the fused volume in meters. Default: the median depth divided by 300.",
+)
+@click.option(
+    "--neighbors",
+    type=click.IntRange(min=1),
+    default=3,
+    show_default=True,
+    help="Odometry pairs from each keyframe to the ones before it.",
+)
+@click.option(
+    "--min-views",
+    type=click.IntRange(min=1),
+    default=2,
+    show_default=True,
+    help="Keep only surfaces seen by at least this many keyframes, against moving objects.",
+)
+@click.option(
+    "--colmap",
+    is_flag=True,
+    help="Also write a COLMAP model with the keyframes, to refine in COLMAP or to train "
+    "Gaussian splatting from.",
+)
+def reconstruct_cli(
+    input_path: Path,
+    output_path: Path,
+    model: str,
+    window: int,
+    overlap: int,
+    precision: str | None,
+    stride: int,
+    resolution: int,
+    max_depth: float | None,
+    voxel: float | None,
+    neighbors: int,
+    min_views: int,
+    colmap: bool,
+):
+    """Reconstruct a static scene in 3D from a video: camera poses, a mesh and a point cloud.
+
+    \b
+    Writes into the output folder, for an input NAME:
+      NAME-mesh.ply             colored triangle mesh, in meters
+      NAME-cloud.ply            colored point cloud with normals
+      NAME-cameras.json         intrinsics, and each keyframe's camera-to-world pose
+      NAME-trajectory.txt       the same poses in the TUM format
+      NAME-colmap/              with --colmap: sparse/0/*.txt and the keyframes in images/
+    The world frame is the first frame's camera: x right, y down and z forward.
+    Moving objects, mirrors and long videos without revisits make the poses drift.
+    """  # noqa: D301 - click keeps a paragraph after \b as written.
+    from . import reconstruct as rec
+
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")
+    logging.basicConfig(format="%(message)s")
+    logging.getLogger("depth_pro_2").setLevel(logging.INFO)
+    if overlap >= window:
+        raise click.BadParameter(
+            f"{overlap} must be less than --window ({window}).", param_hint="'--overlap'"
+        )
+    try:
+        rec.import_open3d()
+    except ImportError as error:
+        raise click.ClickException(str(error)) from error
+
+    device = default_device()
+    net, transform = create_model_and_transforms(
+        model, device, None if precision is None else PRECISIONS[precision]
+    )
+    click.echo(f"Loading {model} onto {device} in {str(net.precision).removeprefix('torch.')}.")
+    output_path.mkdir(parents=True, exist_ok=True)
+    name = input_path.stem if input_path.is_file() else input_path.name
+    colmap_images = output_path / f"{name}-colmap" / "images" if colmap else None
+    if colmap_images is not None:
+        colmap_images.mkdir(parents=True, exist_ok=True)
+
+    def save_keyframe(index: int, image: np.ndarray, prediction: Mapping) -> None:
+        if colmap_images is not None:
+            Image.fromarray(image).save(colmap_images / rec.colmap_image_name(index), quality=95)
+
+    options = rec.ReconstructionOptions(stride, resolution, max_depth, voxel, neighbors, min_views)
+    pending: deque[np.ndarray] = deque()
+    fps = None
+    with ExitStack() as stack:
+        if input_path.is_dir():
+            paths = sorted(
+                p
+                for p in input_path.iterdir()
+                if p.is_file()
+                and p.suffix.lower() in get_supported_image_extensions()
+                and not p.name.startswith(".")
+            )
+            if len(paths) < 2:
+                raise click.UsageError(f"Fewer than two images in {input_path}.")
+            first, f_px = load_rgb(paths[0])
+            expected = len(paths)
+
+            def frames():
+                for path in paths:
+                    image = first if path == paths[0] else load_rgb(path)[0]
+                    if image.shape != first.shape:
+                        raise click.UsageError(f"{path} differs in size from {paths[0]}.")
+                    pending.append(image)
+                    yield transform(image)
+
+        else:
+            container = stack.enter_context(av.open(str(input_path)))
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            fps = float(stream.average_rate or 30.0)
+            expected = stream.frames or round((container.duration or 0) / av.time_base * fps)
+            f_px = None
+
+            def frames():
+                for frame in container.decode(stream):
+                    image = upright(frame)
+                    pending.append(image)
+                    yield transform(image)
+
+        predictions = net.infer_video(frames(), window, overlap, f_px, mode="buffered")
+        bar = stack.enter_context(
+            click.progressbar(predictions, expected or None, label=f"Depth of {input_path.name}")
+        )
+        images = (pending.popleft() for _ in iter(int, 1))
+        try:
+            result = rec.reconstruct(bar, images, options, save_keyframe)
+        except torch.OutOfMemoryError as error:
+            raise click.ClickException(
+                f"Out of {device.type.upper()} memory. Lower --window and --overlap first; then "
+                f"use a smaller model, such as -m depthpro2-s."
+            ) from error
+
+    written = rec.write_outputs(result, output_path, name, fps, colmap_images)
+    path_length = sum(
+        float(np.linalg.norm(b[:3, 3] - a[:3, 3])) for a, b in zip(result.poses, result.poses[1:])
+    )
+    click.echo(f"Wrote {', '.join(str(p) for p in written)}.")
+    click.echo(
+        f"{len(result.keyframes)} keyframes, camera path {path_length:.2f} m, "
+        f"{len(result.mesh.triangles)} triangles, {len(result.cloud.points)} points; "
+        f"depth up to {result.max_depth:.1f} m, {100 * result.voxel:.1f} cm voxels."
+    )
+    if result.failed_edges:
+        click.echo(
+            f"Warning: odometry failed between {result.failed_edges} consecutive keyframes, "
+            f"where the poses guess constant motion. Lower --stride, or film more slowly."
+        )
 
 
 def collect_inputs(paths: Sequence[Path], output_path: Path) -> list[Path]:
@@ -186,8 +430,9 @@ def collect_inputs(paths: Sequence[Path], output_path: Path) -> list[Path]:
                 if p.is_file() and p.suffix.lower() in supported and not p.name.startswith(".")
             )
             if path.resolve() == output_path.resolve():
-                outputs = {f"{p.stem}-depth{tag}" for p in found for tag in ("", "16")}
-                found = [p for p in found if p.stem not in outputs]
+                tags = ("depth", "depth16", "normals")
+                written = {f"{p.stem}-{tag}" for p in found for tag in tags}
+                found = [p for p in found if p.stem not in written]
             if not found:
                 raise click.UsageError(f"No supported image or video in {path}.")
             inputs += found
@@ -211,13 +456,23 @@ def collect_inputs(paths: Sequence[Path], output_path: Path) -> list[Path]:
     return inputs
 
 
+@dataclass(frozen=True)
+class Outputs:
+    """The outputs to write besides the color preview."""
+
+    npz: bool = False
+    png16: bool = False
+    normals: bool = False
+    ply: bool = False
+    max_depth: float | None = None
+
+
 def predict_image(
     net: DepthPro2,
     transform: Callable[[np.ndarray], torch.Tensor],
     input_path: Path,
     output_path: Path,
-    save_npz: bool,
-    save_png16: bool,
+    outputs: Outputs,
 ) -> None:
     """Predict one image, write its preview and arrays, and print a summary."""
     image, f_px = load_rgb(input_path)
@@ -228,18 +483,27 @@ def predict_image(
     scale = color_scale(inverse_depth)
     Image.fromarray(colorize(inverse_depth, scale)).save(png, compress_level=1)
     written = [str(png)]
-    if save_npz:
-        write_npz(png.with_suffix(".npz"), prediction)
+    normals = frame_normals(prediction, outputs)
+    if outputs.npz:
+        write_npz(png.with_suffix(".npz"), prediction, normals if outputs.normals else None)
         written.append(str(png.with_suffix(".npz")))
-    if save_png16:
+    if outputs.png16:
         png16 = output_path / f"{input_path.stem}-depth16.png"
         grayscale16(inverse_depth, scale).save(png16, compress_level=1)
         written.append(str(png16))
+    if outputs.normals:
+        normal_png = output_path / f"{input_path.stem}-normals.png"
+        Image.fromarray(normals_to_rgb(normals.cpu().numpy())).save(normal_png, compress_level=1)
+        written.append(str(normal_png))
+    if outputs.ply:
+        ply = output_path / f"{input_path.stem}-points.ply"
+        write_frame_ply(ply, prediction, image, normals, outputs.max_depth)
+        written.append(str(ply))
 
     counts = np.zeros(len(DEPTH_BINS), dtype=np.int64)
     count_depth(counts, inverse_depth)
     source = "from EXIF" if f_px is not None else "estimated"
-    print_summary(written, prediction, source, counts, scale if save_png16 else None)
+    print_summary(written, prediction, source, counts, scale if outputs.png16 else None)
 
 
 def predict_video(
@@ -250,42 +514,71 @@ def predict_video(
     mode: str,
     window: int,
     overlap: int,
-    save_npz: bool,
-    save_png16: bool,
+    outputs: Outputs,
 ) -> None:
     """Predict a video frame by frame, write its preview and arrays, and print a summary."""
     video_path = output_path / f"{input_path.stem}-depth.mp4"
+    normals_path = output_path / f"{input_path.stem}-normals.mp4"
     npz_dir = output_path / f"{input_path.stem}-depth"
     png16_dir = output_path / f"{input_path.stem}-depth16"
-    if save_npz:
-        npz_dir.mkdir(exist_ok=True)
-    if save_png16:
-        png16_dir.mkdir(exist_ok=True)
+    ply_dir = output_path / f"{input_path.stem}-points"
+    candidates = ((npz_dir, outputs.npz), (png16_dir, outputs.png16), (ply_dir, outputs.ply))
+    folders = [folder for folder, wanted in candidates if wanted]
+    for folder in folders:
+        folder.mkdir(exist_ok=True)
     counts = np.zeros(len(DEPTH_BINS), dtype=np.int64)
     scale = prediction = None
     count = 0
+    # The RGB frames waiting for their prediction, to color the point clouds.
+    pending: deque[np.ndarray] = deque()
 
     with av.open(str(input_path)) as container:
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
         fps = float(stream.average_rate or 30.0)
         expected = stream.frames or round((container.duration or 0) / av.time_base * fps)
-        frames = (transform(upright(frame)) for frame in container.decode(stream))
-        predictions = net.infer_video(frames, window, overlap, mode=mode)
-        with (
-            VideoWriter(video_path, fps) as writer,
-            click.progressbar(predictions, expected or None, label=input_path.name) as bar,
-        ):
+
+        def frames():
+            for frame in container.decode(stream):
+                image = upright(frame)
+                if outputs.ply:
+                    pending.append(image)
+                yield transform(image)
+
+        predictions = net.infer_video(frames(), window, overlap, mode=mode)
+        with ExitStack() as stack:
+            writer = stack.enter_context(VideoWriter(video_path, fps))
+            normals_writer = None
+            if outputs.normals:
+                normals_writer = stack.enter_context(VideoWriter(normals_path, fps))
+            bar = stack.enter_context(
+                click.progressbar(predictions, expected or None, label=input_path.name)
+            )
             for prediction in bar:
                 inverse_depth = inverse_metric_depth(prediction)
                 if scale is None:
                     scale = color_scale(inverse_depth)
                 writer.write(colorize(inverse_depth, scale))
-                if save_npz:
-                    write_npz(npz_dir / f"{count:06d}.npz", prediction)
-                if save_png16:
+                normals = frame_normals(prediction, outputs)
+                if outputs.npz:
+                    write_npz(
+                        npz_dir / f"{count:06d}.npz",
+                        prediction,
+                        normals if outputs.normals else None,
+                    )
+                if outputs.png16:
                     grayscale16(inverse_depth, scale).save(
                         png16_dir / f"{png16_dir.name}.{count:06d}.png", compress_level=1
+                    )
+                if normals_writer is not None:
+                    normals_writer.write(normals_to_rgb(normals.cpu().numpy()))
+                if outputs.ply:
+                    write_frame_ply(
+                        ply_dir / f"{count:06d}.ply",
+                        prediction,
+                        pending.popleft(),
+                        normals,
+                        outputs.max_depth,
                     )
                 count_depth(counts, inverse_depth)
                 count += 1
@@ -293,12 +586,32 @@ def predict_video(
     if prediction is None:
         raise click.ClickException(f"No frames decoded from {input_path}.")
     written = [f"{count} frames at {fps:.5g} fps to {video_path}"]
-    if save_npz:
-        written.append(f"{npz_dir}/")
-    if save_png16:
-        written.append(f"{png16_dir}/")
+    if outputs.normals:
+        written.append(str(normals_path))
+    written += [f"{folder}/" for folder in folders]
     source = f"estimated from the first {min(window, count)} frames"
-    print_summary(written, prediction, source, counts, scale if save_png16 else None)
+    print_summary(written, prediction, source, counts, scale if outputs.png16 else None)
+
+
+def frame_normals(prediction: Mapping[str, torch.Tensor], outputs: Outputs) -> torch.Tensor | None:
+    """The frame's normals ``(H, W, 3)`` if an output needs them, else ``None``."""
+    if not (outputs.normals or outputs.ply):
+        return None
+    return depth_normals(prediction["depth"], prediction["focallength_px"])
+
+
+def write_frame_ply(
+    path: Path,
+    prediction: Mapping[str, torch.Tensor],
+    image: np.ndarray,
+    normals: torch.Tensor,
+    max_depth: float | None,
+) -> None:
+    """Write a frame's colored point cloud with normals, without sky and depth edges."""
+    points, colors, point_normals = point_cloud(
+        prediction["depth"], prediction["focallength_px"], image, max_depth, frame_normals=normals
+    )
+    write_ply(path, points, colors, point_normals)
 
 
 def inverse_metric_depth(prediction: Mapping[str, torch.Tensor]) -> np.ndarray:
@@ -307,13 +620,25 @@ def inverse_metric_depth(prediction: Mapping[str, torch.Tensor]) -> np.ndarray:
     return inverse_depth * (inverse_depth.shape[-1] / float(prediction["focallength_px"]))
 
 
-def write_npz(path: Path, prediction: Mapping[str, torch.Tensor]) -> None:
-    """Write depth in meters and the focal length in pixels to an uncompressed npz."""
-    np.savez(
-        path,
-        depth=prediction["depth"].float().cpu().numpy(),
-        focallength_px=np.float32(prediction["focallength_px"].item()),
-    )
+def write_npz(
+    path: Path, prediction: Mapping[str, torch.Tensor], normals: torch.Tensor | None = None
+) -> None:
+    """Write depth in meters, the focal length in pixels, the intrinsics and, if given, normals.
+
+    The npz is uncompressed. ``intrinsics`` is the 3x3 camera matrix, with the principal point at
+    the image center; ``normals`` are ``(H, W, 3)`` unit vectors in the camera frame, zero where
+    undefined.
+    """
+    depth = prediction["depth"].float().cpu().numpy()
+    f_px = float(prediction["focallength_px"])
+    arrays = {
+        "depth": depth,
+        "focallength_px": np.float32(f_px),
+        "intrinsics": intrinsics(f_px, depth.shape[1], depth.shape[0]),
+    }
+    if normals is not None:
+        arrays["normals"] = normals.cpu().numpy().astype(np.float32)
+    np.savez(path, **arrays)
 
 
 def color_scale(inverse_depth: np.ndarray) -> float:
