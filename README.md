@@ -45,6 +45,8 @@ Install with uv: `pip install .` ignores the CUDA index in `pyproject.toml` and 
 
 [`notebooks/depth_pro_2_colab_a100.ipynb`](notebooks/depth_pro_2_colab_a100.ipynb) installs the repository on a Colab GPU runtime, runs the examples, times the four model sizes and compares the precisions, then runs on your own photos and videos. [Open it in Colab](https://colab.research.google.com/github/Cortex78/ml-depth-pro-2/blob/claude/festive-cerf-65vitz/notebooks/depth_pro_2_colab_a100.ipynb), choose Runtime → Change runtime type → A100 GPU, and run all cells.
 
+For one picture only, [`notebooks/depth_pro_2_picture_normals.ipynb`](notebooks/depth_pro_2_picture_normals.ipynb) takes an uploaded picture and returns its depth, normal map and point cloud from the largest model, H+. [Open it in Colab](https://colab.research.google.com/github/Cortex78/ml-depth-pro-2/blob/claude/festive-cerf-65vitz/notebooks/depth_pro_2_picture_normals.ipynb).
+
 ## Outputs
 
 The command writes its results to the folder given by `-o`:
