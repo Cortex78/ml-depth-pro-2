@@ -23,7 +23,8 @@ import torch
 from matplotlib import colormaps
 from PIL import Image
 
-from .geometry import intrinsics, point_cloud, write_ply
+from .geometry import intrinsics, normals_to_rgb, point_cloud, write_ply
+from .geometry import normals as depth_normals
 from .model import (
     DEFAULT_MODEL,
     DEFAULT_OVERLAP,
@@ -125,10 +126,16 @@ def main_cli():
     "white is near and black is infinitely far, on the color preview's scale.",
 )
 @click.option(
+    "--save-normals",
+    is_flag=True,
+    help="Also write surface normals, computed from the depth, as a normal map: a PNG for an "
+    "image, an MP4 for a video. With --save-npz, the .npz also holds them, in the camera frame.",
+)
+@click.option(
     "--save-ply",
     is_flag=True,
-    help="Also write a colored 3D point cloud as .ply, in meters in the camera frame. "
-    "A video gets one file per frame: 15 bytes per point, about 25 MB at 1920x1440.",
+    help="Also write a colored 3D point cloud with normals as .ply, in meters in the camera frame. "
+    "A video gets one file per frame: 27 bytes per point, about 40 MB at 1920x1440.",
 )
 @click.option(
     "--max-depth",
@@ -140,7 +147,7 @@ def main_cli():
 @click.option(
     "--save-all",
     is_flag=True,
-    help="Write every output: --save-npz, --save-png16 and --save-ply.",
+    help="Write every output: --save-npz, --save-png16, --save-normals and --save-ply.",
 )
 def predict_cli(
     input_path: tuple[Path, ...],
@@ -152,6 +159,7 @@ def predict_cli(
     precision: str | None,
     save_npz: bool,
     save_png16: bool,
+    save_normals: bool,
     save_ply: bool,
     max_depth: float,
     save_all: bool,
@@ -163,13 +171,17 @@ def predict_cli(
       NAME-depth.png                        inverse depth in color, for an image
       NAME-depth.mp4                        the same for a video
       NAME-depth.npz                        with --save-npz: depth in meters, focallength_px
-                                            and the 3x3 intrinsics
+                                            and the 3x3 intrinsics, and normals with
+                                            --save-normals
       NAME-depth/000000.npz                 the same for a video, one file per frame
       NAME-depth16.png                      with --save-png16: inverse depth in 16-bit gray
       NAME-depth16/NAME-depth16.000000.png  the same for a video, one file per frame
-      NAME-points.ply                       with --save-ply: colored point cloud
+      NAME-normals.png                      with --save-normals: normal map, for an image
+      NAME-normals.mp4                      the same for a video
+      NAME-points.ply                       with --save-ply: colored point cloud with normals
       NAME-points/000000.ply                the same for a video, one file per frame
-    Colors follow the Turbo map: dark blue is infinitely far, where depth is inf. Arrays and
+    Colors follow the Turbo map: dark blue is infinitely far, where depth is inf. Normal maps
+    follow the OpenGL convention: red right, green up and blue toward the camera. Arrays and
     point clouds are in the camera frame of OpenCV: x right, y down and z forward.
     """  # noqa: D301 - click keeps a paragraph after \b as written.
     # A redirected stdout on Windows uses the ANSI code page, which cannot encode every file name.
@@ -185,6 +197,7 @@ def predict_cli(
     outputs = Outputs(
         npz=save_npz or save_all,
         png16=save_png16 or save_all,
+        normals=save_normals or save_all,
         ply=save_ply or save_all,
         max_depth=max_depth,
     )
@@ -301,7 +314,7 @@ def reconstruct_cli(
     \b
     Writes into the output folder, for an input NAME:
       NAME-mesh.ply             colored triangle mesh, in meters
-      NAME-cloud.ply            its vertices as a colored point cloud
+      NAME-cloud.ply            colored point cloud with normals
       NAME-cameras.json         intrinsics, and each keyframe's camera-to-world pose
       NAME-trajectory.txt       the same poses in the TUM format
       NAME-colmap/              with --colmap: sparse/0/*.txt and the keyframes in images/
@@ -446,7 +459,7 @@ def collect_inputs(paths: Sequence[Path], output_path: Path) -> list[Path]:
                 if p.is_file() and p.suffix.lower() in supported and not p.name.startswith(".")
             )
             if path.resolve() == output_path.resolve():
-                tags = ("depth", "depth16")
+                tags = ("depth", "depth16", "normals")
                 written = {f"{p.stem}-{tag}" for p in found for tag in tags}
                 found = [p for p in found if p.stem not in written]
             if not found:
@@ -478,6 +491,7 @@ class Outputs:
 
     npz: bool = False
     png16: bool = False
+    normals: bool = False
     ply: bool = False
     max_depth: float | None = None
 
@@ -498,16 +512,21 @@ def predict_image(
     scale = color_scale(inverse_depth)
     Image.fromarray(colorize(inverse_depth, scale)).save(png, compress_level=1)
     written = [str(png)]
+    normals = frame_normals(prediction, outputs)
     if outputs.npz:
-        write_npz(png.with_suffix(".npz"), prediction)
+        write_npz(png.with_suffix(".npz"), prediction, normals if outputs.normals else None)
         written.append(str(png.with_suffix(".npz")))
     if outputs.png16:
         png16 = output_path / f"{input_path.stem}-depth16.png"
         grayscale16(inverse_depth, scale).save(png16, compress_level=1)
         written.append(str(png16))
+    if outputs.normals:
+        normal_png = output_path / f"{input_path.stem}-normals.png"
+        Image.fromarray(normals_to_rgb(normals.cpu().numpy())).save(normal_png, compress_level=1)
+        written.append(str(normal_png))
     if outputs.ply:
         ply = output_path / f"{input_path.stem}-points.ply"
-        write_frame_ply(ply, prediction, image, outputs.max_depth)
+        write_frame_ply(ply, prediction, image, normals, outputs.max_depth)
         written.append(str(ply))
 
     counts = np.zeros(len(DEPTH_BINS), dtype=np.int64)
@@ -528,6 +547,7 @@ def predict_video(
 ) -> None:
     """Predict a video frame by frame, write its preview and arrays, and print a summary."""
     video_path = output_path / f"{input_path.stem}-depth.mp4"
+    normals_path = output_path / f"{input_path.stem}-normals.mp4"
     npz_dir = output_path / f"{input_path.stem}-depth"
     png16_dir = output_path / f"{input_path.stem}-depth16"
     ply_dir = output_path / f"{input_path.stem}-points"
@@ -557,6 +577,9 @@ def predict_video(
         predictions = net.infer_video(frames(), window, overlap, mode=mode)
         with ExitStack() as stack:
             writer = stack.enter_context(VideoWriter(video_path, fps))
+            normals_writer = None
+            if outputs.normals:
+                normals_writer = stack.enter_context(VideoWriter(normals_path, fps))
             bar = stack.enter_context(
                 click.progressbar(predictions, expected or None, label=input_path.name)
             )
@@ -565,17 +588,25 @@ def predict_video(
                 if scale is None:
                     scale = color_scale(inverse_depth)
                 writer.write(colorize(inverse_depth, scale))
+                normals = frame_normals(prediction, outputs)
                 if outputs.npz:
-                    write_npz(npz_dir / f"{count:06d}.npz", prediction)
+                    write_npz(
+                        npz_dir / f"{count:06d}.npz",
+                        prediction,
+                        normals if outputs.normals else None,
+                    )
                 if outputs.png16:
                     grayscale16(inverse_depth, scale).save(
                         png16_dir / f"{png16_dir.name}.{count:06d}.png", compress_level=1
                     )
+                if normals_writer is not None:
+                    normals_writer.write(normals_to_rgb(normals.cpu().numpy()))
                 if outputs.ply:
                     write_frame_ply(
                         ply_dir / f"{count:06d}.ply",
                         prediction,
                         pending.popleft(),
+                        normals,
                         outputs.max_depth,
                     )
                 count_depth(counts, inverse_depth)
@@ -584,22 +615,32 @@ def predict_video(
     if prediction is None:
         raise click.ClickException(f"No frames decoded from {input_path}.")
     written = [f"{count} frames at {fps:.5g} fps to {video_path}"]
+    if outputs.normals:
+        written.append(str(normals_path))
     written += [f"{folder}/" for folder in folders]
     source = f"estimated from the first {min(window, count)} frames"
     print_summary(written, prediction, source, counts, scale if outputs.png16 else None)
+
+
+def frame_normals(prediction: Mapping[str, torch.Tensor], outputs: Outputs) -> torch.Tensor | None:
+    """The frame's normals ``(H, W, 3)`` if an output needs them, else ``None``."""
+    if not (outputs.normals or outputs.ply):
+        return None
+    return depth_normals(prediction["depth"], prediction["focallength_px"])
 
 
 def write_frame_ply(
     path: Path,
     prediction: Mapping[str, torch.Tensor],
     image: np.ndarray,
+    normals: torch.Tensor,
     max_depth: float | None,
 ) -> None:
-    """Write a frame's colored point cloud, without sky and depth edges."""
-    points, colors = point_cloud(
-        prediction["depth"], prediction["focallength_px"], image, max_depth
+    """Write a frame's colored point cloud with normals, without sky and depth edges."""
+    points, colors, point_normals = point_cloud(
+        prediction["depth"], prediction["focallength_px"], image, max_depth, frame_normals=normals
     )
-    write_ply(path, points, colors)
+    write_ply(path, points, colors, point_normals)
 
 
 def inverse_metric_depth(prediction: Mapping[str, torch.Tensor]) -> np.ndarray:
@@ -608,20 +649,25 @@ def inverse_metric_depth(prediction: Mapping[str, torch.Tensor]) -> np.ndarray:
     return inverse_depth * (inverse_depth.shape[-1] / float(prediction["focallength_px"]))
 
 
-def write_npz(path: Path, prediction: Mapping[str, torch.Tensor]) -> None:
-    """Write depth in meters, the focal length in pixels and the intrinsics.
+def write_npz(
+    path: Path, prediction: Mapping[str, torch.Tensor], normals: torch.Tensor | None = None
+) -> None:
+    """Write depth in meters, the focal length in pixels, the intrinsics and, if given, normals.
 
     The npz is uncompressed. ``intrinsics`` is the 3x3 camera matrix, with the principal point at
-    the image center.
+    the image center; ``normals`` are ``(H, W, 3)`` unit vectors in the camera frame, zero where
+    undefined.
     """
     depth = prediction["depth"].float().cpu().numpy()
     f_px = float(prediction["focallength_px"])
-    np.savez(
-        path,
-        depth=depth,
-        focallength_px=np.float32(f_px),
-        intrinsics=intrinsics(f_px, depth.shape[1], depth.shape[0]),
-    )
+    arrays = {
+        "depth": depth,
+        "focallength_px": np.float32(f_px),
+        "intrinsics": intrinsics(f_px, depth.shape[1], depth.shape[0]),
+    }
+    if normals is not None:
+        arrays["normals"] = normals.cpu().numpy().astype(np.float32)
+    np.savez(path, **arrays)
 
 
 def color_scale(inverse_depth: np.ndarray) -> float:

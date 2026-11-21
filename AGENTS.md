@@ -23,8 +23,7 @@ uv run depth-pro-2 predict -i assets/example.mp4 -o out/ -m depthpro2-s
 - `src/depth_pro_2/utils.py`: `load_rgb` (a photo, upright, with its EXIF focal length),
   `upright` (a decoded video frame, upright), `default_device`.
 - `src/depth_pro_2/geometry.py`: what follows from depth and the focal length: intrinsics, 3D
-  points, depth edges, PLY files. The network outputs depth and field of view only: nothing
-  else, such as normals, is derived as a model output.
+  points, normals, depth edges, PLY files.
 - `src/depth_pro_2/reconstruct.py`: poses (SIFT + PnP, dense odometry fallback, pose graph) and
   TSDF fusion of a video, with Open3D and OpenCV (`uv sync --extra reconstruct`).
 - `src/depth_pro_2/cli.py`: the `predict` and `reconstruct` commands.

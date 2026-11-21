@@ -54,15 +54,17 @@ The command writes its results to the folder given by `-o`:
 | Always | `<name>-depth.png` | `<name>-depth.mp4` |
 | `--save-png16` | `<name>-depth16.png` | `<name>-depth16/`, a PNG per frame |
 | `--save-npz` | `<name>-depth.npz` | `<name>-depth/`, a file per frame |
+| `--save-normals` | `<name>-normals.png` | `<name>-normals.mp4` |
 | `--save-ply` | `<name>-points.ply` | `<name>-points/`, a file per frame |
 | `--save-all` | all of the above | all of the above |
 
-The network predicts two things: depth, at every pixel, and the field of view, which gives the focal length. The 3D points follow from the two. For a 3D model of a whole scene from a video, see [3D reconstruction](#3d-reconstruction).
+The network predicts two things: depth, at every pixel, and the field of view, which gives the focal length. Everything else here is computed from them: the normals and the 3D points follow from the depth and the focal length. For a 3D model of a whole scene from a video, see [3D reconstruction](#3d-reconstruction).
 
 - The PNG or MP4 shows depth as a color image, red near and blue far.
 - `--save-png16` adds inverse depth as 16-bit grayscale PNGs, white near and black far, for editing and compositing tools. Read them as raw data (Raw in Nuke, Non-Color in Blender). The values are scaled to the depth range of the photo, or of a video's first frame, so points that come nearer later in a video saturate at white. The command prints how to convert the values to meters.
-- `--save-npz` adds the depth itself. Each file holds `depth`, in meters, `focallength_px`, the focal length used, in pixels, and `intrinsics`, the 3x3 camera matrix.
-- `--save-ply` adds a colored point cloud, in meters, for MeshLab, CloudCompare or Blender. It leaves out sky (`--max-depth`, 1000 m by default) and points on occlusion boundaries, which would float between the two surfaces. Each point takes 15 bytes: at 1920x1440, a file is about 25 MB, and up to 41 MB without sky.
+- `--save-npz` adds the depth itself. Each file holds `depth`, in meters, `focallength_px`, the focal length used, in pixels, and `intrinsics`, the 3x3 camera matrix. With `--save-normals`, it also holds `normals`, `(H, W, 3)` unit vectors.
+- `--save-normals` adds surface normals as a normal map: red points right, green up and blue toward the camera, as in OpenGL and Blender, so a wall facing the camera is light blue and the ground is green. Pixels without a normal, such as sky, are black. Each normal spans a few pixels (6 at 1920 wide), since depth varies too finely from pixel to pixel to give a steady normal on distant surfaces, and stays on its own side of an occlusion boundary.
+- `--save-ply` adds a colored point cloud with normals, in meters, for MeshLab, CloudCompare or Blender. It leaves out sky (`--max-depth`, 1000 m by default) and points on occlusion boundaries, which would float between the two surfaces. Each point takes 27 bytes: at 1920x1440, a file is about 40 MB, and up to 75 MB without sky.
 - The arrays and point clouds are in the camera frame of OpenCV and COLMAP: x right, y down and z forward. `intrinsics` follows OpenCV: the top-left pixel's center is at (0, 0), so the principal point is at ((width - 1) / 2, (height - 1) / 2).
 
 ### Interpreting the depth
@@ -89,7 +91,7 @@ uv run depth-pro-2 reconstruct -i assets/example.mp4 -o out/ -m depthpro2-s --co
 | Output | |
 |---|---|
 | `<name>-mesh.ply` | Colored triangle mesh, in meters |
-| `<name>-cloud.ply` | Its vertices as a colored point cloud |
+| `<name>-cloud.ply` | Its vertices as a point cloud with normals |
 | `<name>-cameras.json` | The intrinsics, and each keyframe's camera-to-world pose |
 | `<name>-trajectory.txt` | The same poses in the TUM format |
 | `<name>-colmap/` | With `--colmap`: a COLMAP text model (`sparse/0`) and the keyframes (`images/`) |
