@@ -29,7 +29,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Sequence
 
 import numpy as np
 import torch
@@ -184,6 +184,9 @@ def estimate_poses(
     motion = np.eye(4)  # The last relative motion, for a constant velocity guess.
     failed = 0
     for t in range(1, len(keyframes)):
+        # Only the last few keyframes are compared: free what is older.
+        match.forget_before(t - neighbors)
+        dense.forget_before(t - neighbors)
         # The consecutive pair first: it sets frame t's pose, the guess for the other pairs.
         for s in [t - 1, *range(max(0, t - neighbors), t - 1)]:
             consecutive = s == t - 1
@@ -237,16 +240,26 @@ class FeatureMatcher:
         )
         # 2 pixels at 640 wide, in proportion above.
         self.max_error = 2.0 * max(1.0, width / 640)
-        sift = cv2.SIFT_create(nfeatures=4000)
-        self.features = [
-            sift.detectAndCompute(cv2.cvtColor(k.rgb, cv2.COLOR_RGB2GRAY), None) for k in keyframes
-        ]
+        self.sift = cv2.SIFT_create(nfeatures=4000)
         self.matcher = cv2.BFMatcher(cv2.NORM_L2)
+        self.features: dict[int, tuple] = {}
+
+    def feature(self, i: int) -> tuple:
+        """Keyframe i's SIFT keypoints and descriptors, detected on first use."""
+        if i not in self.features:
+            gray = self.cv2.cvtColor(self.keyframes[i].rgb, self.cv2.COLOR_RGB2GRAY)
+            self.features[i] = self.sift.detectAndCompute(gray, None)
+        return self.features[i]
+
+    def forget_before(self, i: int) -> None:
+        """Free the features of keyframes before i."""
+        for j in [j for j in self.features if j < i]:
+            del self.features[j]
 
     def __call__(self, s: int, t: int) -> tuple[np.ndarray | None, float]:
         """The motion from frame s to frame t and its number of inliers, or ``(None, 0)``."""
         cv2 = self.cv2
-        (points_s, desc_s), (points_t, desc_t) = self.features[s], self.features[t]
+        (points_s, desc_s), (points_t, desc_t) = self.feature(s), self.feature(t)
         if desc_s is None or desc_t is None or len(desc_s) < 2 or len(desc_t) < 2:
             return None, 0.0
         matches = [
@@ -298,8 +311,9 @@ class DenseOdometry:
     def __init__(self, keyframes: list[Keyframe], f_px: float, max_depth: float):
         """Prepare the grayscale RGB-D images."""
         o3d = import_open3d()
-        self.o3d = o3d
+        self.o3d, self.keyframes, self.max_depth = o3d, keyframes, max_depth
         height, width = keyframes[0].depth.shape
+        self.pixels = height * width
         self.intrinsic = pinhole(o3d, f_px, width, height)
         sample = np.concatenate([k.depth[::8, ::8].ravel() for k in keyframes[:8]])
         median = float(np.median(sample[sample > 0])) if (sample > 0).any() else 1.0
@@ -309,21 +323,35 @@ class DenseOdometry:
         self.option.depth_diff_max = self.depth_diff_max
         self.option.depth_min = 0.0
         self.option.depth_max = max_depth
-        self.images = [rgbd_image(o3d, k, max_depth, intensity=True) for k in keyframes]
+        self.images: dict[int, object] = {}
+
+    def image(self, i: int):
+        """Keyframe i as a grayscale Open3D RGB-D image, made on first use."""
+        if i not in self.images:
+            self.images[i] = rgbd_image(self.o3d, self.keyframes[i], self.max_depth, True)
+        return self.images[i]
+
+    def forget_before(self, i: int) -> None:
+        """Free the images of keyframes before i."""
+        for j in [j for j in self.images if j < i]:
+            del self.images[j]
 
     def __call__(self, s: int, t: int, guess: np.ndarray) -> tuple[np.ndarray | None, float]:
         """The motion from frame s to frame t, from ``guess``, and a weight, or ``(None, 0)``."""
         odometry = self.o3d.pipelines.odometry
-        success, transform, _ = odometry.compute_rgbd_odometry(
-            self.images[s],
-            self.images[t],
+        success, transform, information = odometry.compute_rgbd_odometry(
+            self.image(s),
+            self.image(t),
             self.intrinsic,
             guess,
             odometry.RGBDOdometryJacobianFromHybridTerm(),
             self.option,
         )
+        # Open3D reports success even without correspondences; information[5, 5] counts them.
+        if not success or information[5, 5] < 0.05 * self.pixels:
+            return None, 0.0
         # A weight below a feature match's: dense odometry is the fallback.
-        return (transform, float(FeatureMatcher.MIN_INLIERS)) if success else (None, 0.0)
+        return transform, float(FeatureMatcher.MIN_INLIERS)
 
 
 def fuse(
@@ -357,17 +385,29 @@ def fuse(
         block_count=10_000,  # Grows as needed.
         device=device,
     )
+    integrated = 0
     for keyframe, pose in zip(keyframes, poses):
+        # Open3D aborts on a frame that touches no voxel block: all sky, or all beyond max_depth.
+        if not ((keyframe.depth > 0) & (keyframe.depth < max_depth)).any():
+            LOGGER.warning(
+                "Frame %d has no depth within %.1f m: not fused.", keyframe.index, max_depth
+            )
+            continue
+        integrated += 1
         depth = o3d.t.geometry.Image(keyframe.depth).to(device)
         color = o3d.t.geometry.Image((keyframe.rgb / np.float32(255)).astype(np.float32))
         color = color.to(device)
         extrinsic = o3c.Tensor(np.linalg.inv(pose), dtype=o3c.float64)
         blocks = grid.compute_unique_block_coordinates(depth, intrinsic, extrinsic, 1.0, max_depth)
         grid.integrate(blocks, depth, color, intrinsic, extrinsic, 1.0, max_depth)
+    if not integrated:
+        return o3d.geometry.TriangleMesh(), o3d.geometry.PointCloud()
     # Each keyframe adds a weight of 1 to the voxels it sees; the threshold is exclusive.
-    views = max(1, min(min_views, len(keyframes)))
+    views = max(1, min(min_views, integrated))
     mesh = grid.extract_triangle_mesh(weight_threshold=views - 0.5).to_legacy()
     mesh.compute_vertex_normals()
+    # Averaged colors can overshoot 1 by a rounding error.
+    mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(np.asarray(mesh.vertex_colors), 0, 1))
     cloud = o3d.geometry.PointCloud(mesh.vertices)
     cloud.colors = mesh.vertex_colors
     cloud.normals = mesh.vertex_normals
@@ -438,10 +478,13 @@ def write_outputs(
     result: Reconstruction,
     output_path: Path,
     name: str,
-    fps: float | None,
+    times: Sequence[float] | None,
     colmap_images: Path | None,
 ) -> list[Path]:
     """Write the mesh, point cloud, cameras, trajectory and, if images are given, a COLMAP model.
+
+    ``times`` are the frames' timestamps in seconds, indexed by frame; without them, the
+    trajectory's times are the frame numbers.
 
     Returns:
         The paths written.
@@ -449,10 +492,11 @@ def write_outputs(
     o3d = import_open3d()
     written = []
     mesh_path = output_path / f"{name}-mesh.ply"
-    o3d.io.write_triangle_mesh(str(mesh_path), result.mesh)
+    if o3d.io.write_triangle_mesh(str(mesh_path), result.mesh):
+        written.append(mesh_path)
     cloud_path = output_path / f"{name}-cloud.ply"
-    o3d.io.write_point_cloud(str(cloud_path), result.cloud)
-    written += [mesh_path, cloud_path]
+    if o3d.io.write_point_cloud(str(cloud_path), result.cloud):
+        written.append(cloud_path)
 
     # Cameras at the video's full resolution.
     full_w, full_h = result.full_size
@@ -469,7 +513,11 @@ def write_outputs(
         "max_depth": result.max_depth,
         "voxel": result.voxel,
         "frames": [
-            {"frame": k.index, "camera_to_world": pose.tolist()}
+            {
+                "frame": k.index,
+                "time": None if times is None else times[k.index],
+                "camera_to_world": pose.tolist(),
+            }
             for k, pose in zip(result.keyframes, result.poses)
         ],
     }
@@ -483,7 +531,7 @@ def write_outputs(
         f.write("# time tx ty tz qx qy qz qw (camera-to-world, meters)\n")
         for k, pose in zip(result.keyframes, result.poses):
             w, x, y, z = rotation_to_quaternion(pose[:3, :3])
-            time = k.index / fps if fps else float(k.index)
+            time = float(k.index) if times is None else times[k.index]
             tx, ty, tz = pose[:3, 3]
             f.write(f"{time:.6f} {tx:.6f} {ty:.6f} {tz:.6f} {x:.8f} {y:.8f} {z:.8f} {w:.8f}\n")
     written.append(trajectory_path)

@@ -63,32 +63,51 @@ def normals(
     The tangents span ``step`` pixels on each side, by default 1 per 320 pixels of the longer
     side (6 at 1920): neighboring pixels' depth carries fine noise that would dominate the
     normals of distant surfaces. On each axis, the side whose depth is closest to the pixel's
-    own is used, so a normal stays on its own surface at an occlusion boundary. The normal is
-    zero where it is undefined: infinite depth, or a depth edge on both sides of an axis.
+    own is used, so a normal stays on its own surface at an occlusion boundary. Where both sides
+    of an axis are across a depth edge, as on a pole thinner than the step, shorter steps take
+    over, down to one pixel. The normal is zero where it is undefined: infinite depth, or a depth
+    edge on both sides of an axis even one pixel away.
     """
     height, width = depth.shape
     k = max(1, round(max(height, width) / 320)) if step is None else step
     points = unproject(depth.float(), f_px)
     finite = torch.isfinite(depth)
     points = torch.where(finite[..., None], points, torch.zeros_like(points))
-    neighbors = _neighbors(points.permute(2, 0, 1), k)
-    left, right, up, down = (n.permute(1, 2, 0) - points for n in neighbors)
 
-    # Over k pixels, a smooth surface changes depth by up to about k times as much as over one.
-    jump_left, jump_right, jump_up, jump_down = _relative_jumps(
-        depth, min(0.5, EDGE_THRESHOLD * k), k, borders=True
-    )
-    # The one-sided difference toward the nearer-depth neighbor, signed as a step to the right.
-    use_right = (right[..., 2].abs() <= left[..., 2].abs()) & ~jump_right | jump_left
-    dx = torch.where(use_right[..., None], right, -left)
-    use_down = (down[..., 2].abs() <= up[..., 2].abs()) & ~jump_down | jump_up
-    dy = torch.where(use_down[..., None], down, -up)
+    dx, dy, valid_x, valid_y = _tangents(points, depth, k)
+    while k > 1:
+        k = max(1, k // 2)
+        dx_k, dy_k, valid_x_k, valid_y_k = _tangents(points, depth, k)
+        dx = torch.where((~valid_x & valid_x_k)[..., None], dx_k, dx)
+        dy = torch.where((~valid_y & valid_y_k)[..., None], dy_k, dy)
+        valid_x, valid_y = valid_x | valid_x_k, valid_y | valid_y_k
 
     # x right and y down make dx x dy point away from the camera: flip it to face the camera.
     n = torch.linalg.cross(dy, dx, dim=-1)
     n = n / n.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-    valid = finite & ~((jump_left & jump_right) | (jump_up & jump_down))
+    valid = finite & valid_x & valid_y
     return torch.where(valid[..., None] & torch.isfinite(n), n, torch.zeros_like(n))
+
+
+def _tangents(
+    points: torch.Tensor, depth: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One-sided tangents ``k`` pixels long along x and y, and where each is usable.
+
+    On each axis, the tangent goes to the neighbor whose depth is closest to the pixel's own, as
+    a step right or down. It is unusable where both neighbors are across a depth edge.
+    """
+    neighbors = _neighbors(points.permute(2, 0, 1), k)
+    left, right, up, down = (n.permute(1, 2, 0) - points for n in neighbors)
+    # Over k pixels, a smooth surface changes depth by up to about k times as much as over one.
+    jump_left, jump_right, jump_up, jump_down = _relative_jumps(
+        depth, min(0.5, EDGE_THRESHOLD * k), k, borders=True
+    )
+    use_right = (right[..., 2].abs() <= left[..., 2].abs()) & ~jump_right | jump_left
+    dx = torch.where(use_right[..., None], right, -left)
+    use_down = (down[..., 2].abs() <= up[..., 2].abs()) & ~jump_down | jump_up
+    dy = torch.where(use_down[..., None], down, -up)
+    return dx, dy, ~(jump_left & jump_right), ~(jump_up & jump_down)
 
 
 def _neighbors(x: torch.Tensor, k: int) -> tuple[torch.Tensor, ...]:

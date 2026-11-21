@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import re
 import sys
 from collections import Counter, deque
 from contextlib import ExitStack
@@ -133,7 +135,7 @@ def main_cli():
     "--save-ply",
     is_flag=True,
     help="Also write a colored 3D point cloud with normals as .ply, in meters in the camera frame. "
-    "A video gets one file per frame, about 25 MB each at 1920x1440.",
+    "A video gets one file per frame: 27 bytes per point, about 40 MB at 1920x1440.",
 )
 @click.option(
     "--max-depth",
@@ -225,7 +227,8 @@ def predict_cli(
     "--input-path",
     type=click.Path(path_type=Path, exists=True),
     required=True,
-    help="A video, or a folder of photos of the same size, in order, of a static scene.",
+    help="A video, or a folder of photos of the same size of a static scene, taken in the order "
+    "of their file names (frame2 before frame10).",
 )
 @click.option(
     "-o",
@@ -248,10 +251,9 @@ def predict_cli(
 @click.option(
     "--stride",
     type=click.IntRange(min=1),
-    default=1,
-    show_default=True,
-    help="Use every N-th frame as a keyframe. Raise it for long videos; depth is still "
-    "predicted for every frame, so it stays consistent.",
+    default=None,
+    help="Use every N-th frame as a keyframe; depth is still predicted for every frame, so it "
+    "stays consistent. Default: 1, or enough for at most 300 keyframes, which bounds memory.",
 )
 @click.option(
     "--resolution",
@@ -299,7 +301,7 @@ def reconstruct_cli(
     window: int,
     overlap: int,
     precision: str | None,
-    stride: int,
+    stride: int | None,
     resolution: int,
     max_depth: float | None,
     voxel: float | None,
@@ -340,7 +342,7 @@ def reconstruct_cli(
     )
     click.echo(f"Loading {model} onto {device} in {str(net.precision).removeprefix('torch.')}.")
     output_path.mkdir(parents=True, exist_ok=True)
-    name = input_path.stem if input_path.is_file() else input_path.name
+    name = input_path.stem if input_path.is_file() else input_path.resolve().name or "scene"
     colmap_images = output_path / f"{name}-colmap" / "images" if colmap else None
     if colmap_images is not None:
         colmap_images.mkdir(parents=True, exist_ok=True)
@@ -349,17 +351,21 @@ def reconstruct_cli(
         if colmap_images is not None:
             Image.fromarray(image).save(colmap_images / rec.colmap_image_name(index), quality=95)
 
-    options = rec.ReconstructionOptions(stride, resolution, max_depth, voxel, neighbors, min_views)
+    options = rec.ReconstructionOptions(1, resolution, max_depth, voxel, neighbors, min_views)
+    times: list[float] | None = None
     pending: deque[np.ndarray] = deque()
     fps = None
     with ExitStack() as stack:
         if input_path.is_dir():
             paths = sorted(
-                p
-                for p in input_path.iterdir()
-                if p.is_file()
-                and p.suffix.lower() in get_supported_image_extensions()
-                and not p.name.startswith(".")
+                (
+                    p
+                    for p in input_path.iterdir()
+                    if p.is_file()
+                    and p.suffix.lower() in get_supported_image_extensions()
+                    and not p.name.startswith(".")
+                ),
+                key=natural_key,
             )
             if len(paths) < 2:
                 raise click.UsageError(f"Fewer than two images in {input_path}.")
@@ -381,13 +387,20 @@ def reconstruct_cli(
             fps = float(stream.average_rate or 30.0)
             expected = stream.frames or round((container.duration or 0) / av.time_base * fps)
             f_px = None
+            times = []
 
             def frames():
                 for frame in container.decode(stream):
                     image = upright(frame)
                     pending.append(image)
+                    times.append(float(frame.time) if frame.time is not None else len(times) / fps)
                     yield transform(image)
 
+        if stride is None:
+            stride = max(1, math.ceil(expected / MAX_KEYFRAMES)) if expected else 1
+            if stride > 1:
+                click.echo(f"Keyframes: one every {stride} frames (--stride).")
+        options.stride = stride
         predictions = net.infer_video(frames(), window, overlap, f_px, mode="buffered")
         bar = stack.enter_context(
             click.progressbar(predictions, expected or None, label=f"Depth of {input_path.name}")
@@ -401,7 +414,12 @@ def reconstruct_cli(
                 f"use a smaller model, such as -m depthpro2-s."
             ) from error
 
-    written = rec.write_outputs(result, output_path, name, fps, colmap_images)
+    if not len(result.mesh.vertices):
+        raise click.ClickException(
+            f"Fusion kept no surface: nothing within {result.max_depth:.1f} m was seen by "
+            f"--min-views ({min_views}) keyframes. Lower --min-views or raise --max-depth."
+        )
+    written = rec.write_outputs(result, output_path, name, times, colmap_images)
     path_length = sum(
         float(np.linalg.norm(b[:3, 3] - a[:3, 3])) for a, b in zip(result.poses, result.poses[1:])
     )
@@ -416,6 +434,17 @@ def reconstruct_cli(
             f"Warning: odometry failed between {result.failed_edges} consecutive keyframes, "
             f"where the poses guess constant motion. Lower --stride, or film more slowly."
         )
+
+
+#: The default --stride keeps at most this many keyframes, which bounds reconstruct's memory.
+MAX_KEYFRAMES = 300
+
+
+def natural_key(path: Path) -> list:
+    """Sort key of a file name with its numbers compared as numbers: frame2 before frame10."""
+    return [
+        int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", path.name)
+    ]
 
 
 def collect_inputs(paths: Sequence[Path], output_path: Path) -> list[Path]:
